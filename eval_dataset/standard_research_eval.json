@@ -1,0 +1,22 @@
+[
+  {"id": "HARD-01", "category": "干扰项-数字", "prompt": "我写了 15 页论文，要在 8 点前提交。帮我搜 3 篇关于 'Sora' 的文章。", "expected_function": "arxiv_research_tool", "expected_params": {"topic": "Sora", "count": 3}},
+  {"id": "HARD-02", "category": "语义量化", "prompt": "查找几篇（several）关于大模型长文本处理的论文。", "expected_function": "arxiv_research_tool", "expected_params": {"topic": "大模型长文本处理", "count": 3}},
+  {"id": "HARD-03", "category": "负向约束", "prompt": "找关于 '混合专家模型 (MoE)' 的文献，数量不要超过 2 篇。", "expected_function": "arxiv_research_tool", "expected_params": {"topic": "混合专家模型 (MoE)", "count": 2}},
+  {"id": "HARD-04", "category": "统计路由", "prompt": "帮我计算一下这 5 篇论文的平均引用量是多少？", "expected_function": "arxiv_research_tool", "expected_params": {"count": 5}},
+  {"id": "HARD-05", "category": "字符压力", "prompt": "搜索关于 'C++ & C# 在高性能计算中的对比' 的论文。", "expected_function": "arxiv_research_tool", "expected_params": {"topic": "C++ & C# 在高性能计算中的对比", "count": 3}},
+  {"id": "HARD-06", "category": "边界防御", "prompt": "帮我一次性下载 100000 篇关于深度学习的论文。", "expected_function": "arxiv_research_tool", "expected_params": {"topic": "深度学习", "count": 10}},
+  {"id": "HARD-07", "category": "中英混合", "prompt": "关于 Multi-modal LLM 的综述，给我来 4 个 results。", "expected_function": "arxiv_research_tool", "expected_params": {"topic": "Multi-modal LLM", "count": 4}},
+  {"id": "HARD-08", "category": "标题精准提取", "prompt": "查找标题精确为 'Attention Is All You Need' 的那一篇论文。", "expected_function": "arxiv_research_tool", "expected_params": {"topic": "Attention Is All You Need", "count": 1}},
+  {"id": "HARD-09", "category": "纠错逻辑", "prompt": "帮我找 5 篇，不，还是 2 篇关于固态电池的文章吧。", "expected_function": "arxiv_research_tool", "expected_params": {"topic": "固态电池", "count": 2}},
+  {"id": "HARD-10", "category": "隐喻提取", "prompt": "我想看看去年（2024）关于常温超导最火的那 3 篇论文。", "expected_function": "arxiv_research_tool", "expected_params": {"topic": "2024 常温超导", "count": 3}},
+  {"id": "HARD-11", "category": "多意图干扰", "prompt": "先帮我发封邮件给导师，然后搜 2 篇关于扩散模型的论文。", "expected_function": "arxiv_research_tool", "expected_params": {"topic": "扩散模型", "count": 2}},
+  {"id": "HARD-12", "category": "数学推理", "prompt": "帮我搜平时三倍数量的论文，通常我只要 2 篇，这次关于强化学习。", "expected_function": "arxiv_research_tool", "expected_params": {"topic": "强化学习", "count": 6}},
+  {"id": "HARD-13", "category": "格式陷阱", "prompt": "topic: [智能体规划], count: 5", "expected_function": "arxiv_research_tool", "expected_params": {"topic": "智能体规划", "count": 5}},
+  {"id": "HARD-14", "category": "空值测试", "prompt": "帮我搜搜看（不提供具体主题）。", "expected_function": "None", "expected_params": {}},
+  {"id": "HARD-15", "category": "专业术语缩写", "prompt": "Find 3 papers on SOTA methods for NER tasks.", "expected_function": "arxiv_research_tool", "expected_params": {"topic": "SOTA methods for NER", "count": 3}},
+  {"id": "HARD-16", "category": "地点干扰", "prompt": "在上海的办公室里，帮我搜 2 篇关于自动驾驶的论文。", "expected_function": "arxiv_research_tool", "expected_params": {"topic": "自动驾驶", "count": 2}},
+  {"id": "HARD-17", "category": "序列提取", "prompt": "按照 1, 2, 3 的顺序，帮我搜第 1 篇关于图神经网络的文章。", "expected_function": "arxiv_research_tool", "expected_params": {"topic": "图神经网络", "count": 1}},
+  {"id": "HARD-18", "category": "时间偏移", "prompt": "查找最近 48 小时内发布的 5 篇机器人论文。", "expected_function": "arxiv_research_tool", "expected_params": {"topic": "机器人", "count": 5}},
+  {"id": "HARD-19", "category": "语气诱导", "prompt": "难道你不能帮我找 8 篇关于隐私计算的文章吗？", "expected_function": "arxiv_research_tool", "expected_params": {"topic": "隐私计算", "count": 8}},
+  {"id": "HARD-20", "category": "角色扮演", "prompt": "假设你是一个诺贝尔奖得主，帮我挑选 2 篇你领域最顶尖的论文。", "expected_function": "arxiv_research_tool", "expected_params": {"topic": "最顶尖的论文", "count": 2}}
+]
