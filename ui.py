@@ -16,7 +16,6 @@ LOGIN_URL = API_BASE + "/auth/login"
 REGISTER_URL = API_BASE + "/auth/register"
 LOGOUT_URL = API_BASE + "/auth/logout"
 THREADS_URL = API_BASE + "/v1/threads"
-AUDIT_LOGS_URL = API_BASE + "/api/audit/logs"  # Observer审计纠偏闭环：审计日志接口
 
 # Create a shared session that bypasses system proxy settings.
 # VPN software often sets a system proxy that cannot reach localhost,
@@ -282,215 +281,6 @@ def render_message_history() -> None:
                 render_metrics(message.get("metrics", {}))
 
 
-# ========== Observer审计纠偏闭环：审计日志可视化Tab ==========
-def fetch_audit_logs(thread_id: str) -> dict[str, Any] | None:
-    """调用 GET /api/audit/logs 接口获取指定会话的全部审计日志。"""
-    try:
-        response = _session.get(
-            AUDIT_LOGS_URL,
-            headers=api_headers(),
-            params={"thread_id": thread_id},
-            timeout=15,
-        )
-        if response.status_code == 401:
-            reset_auth_state()
-            st.rerun()
-        if response.status_code != 200:
-            st.error(f"获取审计日志失败: {parse_error(response)}")
-            return None
-        return response.json()
-    except requests.RequestException as exc:
-        st.error(f"无法连接审计日志服务: {exc}")
-        return None
-
-
-def render_audit_logs_tab() -> None:
-    """Observer审计纠偏闭环：在独立Tab中可视化展示审计日志。
-
-    展示内容包括：
-    - 每轮检索关键词
-    - 检索到的论文列表
-    - 缺陷类型与说明
-    - 修正关键词建议
-    - 文献溯源信息（论文标题、来源、年份、分数）
-    """
-    st.markdown("## Observer 审计纠偏日志")
-    st.caption(
-        "展示每轮检索的审计结果：Observer 自动检测文献质量缺陷"
-        "（missing_info / view_conflict / outdated），"
-        "并给出修正关键词建议，驱动 Planner 重规划闭环。"
-    )
-
-    if not st.session_state.active_thread_id:
-        st.info("请先选择一个对话线程，或发起一次研究任务以生成审计日志。")
-        return
-
-    thread_id: str = st.session_state.active_thread_id
-    with st.spinner("正在加载审计日志..."):
-        audit_data = fetch_audit_logs(thread_id)
-
-    if audit_data is None:
-        return
-
-    total_rounds: int = audit_data.get("total_rounds", 0)
-    current_defect: str | None = audit_data.get("current_defect")
-    current_replan_round: int = audit_data.get("current_replan_round", 0)
-    max_replan_times: int = audit_data.get("max_replan_times", 3)
-    logs: list[dict[str, Any]] = audit_data.get("logs", [])
-
-    # --- 审计总览指标 ---
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("审计总轮次", total_rounds)
-    col2.metric("当前重规划轮次", f"{current_replan_round}/{max_replan_times}")
-    defect_display: str = current_defect if current_defect else "无缺陷"
-    col3.metric("当前缺陷类型", defect_display)
-    replan_count: int = sum(1 for log in logs if log.get("need_replan"))
-    col4.metric("触发重规划次数", replan_count)
-
-    if not logs:
-        st.info("暂无审计日志。发起一次研究任务后，Observer 将自动生成审计记录。")
-        return
-
-    st.divider()
-
-    # --- 逐轮审计日志详情 ---
-    for log_entry in logs:
-        round_idx: int = log_entry.get("round_index", 0)
-        defect_type: str | None = log_entry.get("defect_type")
-        need_replan: bool = log_entry.get("need_replan", False)
-
-        # 根据缺陷类型设置展开标签样式
-        if defect_type:
-            expander_label = f"### 第 {round_idx + 1} 轮审计 ⚠️ 缺陷: {defect_type}"
-        elif need_replan:
-            expander_label = f"### 第 {round_idx + 1} 轮审计 🔄 已触发重规划"
-        else:
-            expander_label = f"### 第 {round_idx + 1} 轮审计 ✅ 通过"
-
-        with st.expander(expander_label, expanded=(round_idx == len(logs) - 1)):
-            # 原始查询
-            st.markdown("**原始查询**")
-            st.text(log_entry.get("original_query", ""))
-
-            # 检索关键词
-            st.markdown("**检索关键词**")
-            keywords: list[str] = log_entry.get("planner_keywords", [])
-            if keywords:
-                st.markdown(", ".join(f"`{kw}`" for kw in keywords))
-            else:
-                st.caption("（无关键词记录）")
-
-            # 检索到的论文列表（文献溯源信息 + 三级分级精读评分）
-            st.markdown("**检索到的论文列表（文献溯源 + 分级评分）**")
-            papers: list[dict[str, Any]] = log_entry.get("retrieved_papers", [])
-            rated_papers: list[dict[str, Any]] = log_entry.get("rated_papers", [])
-
-            # ========== 三级文献分级精读：展示阅读等级分布 ==========
-            if rated_papers:
-                level_counts: dict[str, int] = {"deep": 0, "medium": 0, "coarse": 0}
-                for rp in rated_papers:
-                    lv: str = str(rp.get("read_level", "coarse")).lower()
-                    if lv in level_counts:
-                        level_counts[lv] += 1
-                level_col1, level_col2, level_col3 = st.columns(3)
-                level_col1.metric("🔬 深度精读", level_counts.get("deep", 0))
-                level_col2.metric("📖 中度阅读", level_counts.get("medium", 0))
-                level_col3.metric("👀 粗读", level_counts.get("coarse", 0))
-
-            if papers:
-                # 构建增强的论文表格，包含相关度分数和阅读等级
-                paper_rows: list[dict[str, str]] = []
-                # 建立标题到打分信息的映射
-                scored_map: dict[str, dict[str, Any]] = {}
-                for rp in rated_papers:
-                    key: str = str(rp.get("title", "")).strip().lower()
-                    scored_map[key] = rp
-
-                for paper in papers:
-                    title: str = str(paper.get("title", ""))[:80]
-                    title_lower: str = title.strip().lower()
-                    scored: dict[str, Any] | None = scored_map.get(title_lower)
-
-                    # 阅读等级标签（带颜色emoji）
-                    level: str = str(scored.get("read_level", "") if scored else paper.get("read_level", ""))
-                    level_badge: str
-                    if level == "deep":
-                        level_badge = "🔬 deep"
-                    elif level == "medium":
-                        level_badge = "📖 medium"
-                    elif level == "coarse":
-                        level_badge = "👀 coarse"
-                    else:
-                        level_badge = "—"
-
-                    # 相关度分数
-                    score_val = scored.get("relevance_score") if scored else paper.get("relevance_score")
-                    score_display: str = f"{float(score_val):.1f}/10" if score_val is not None else "—"
-
-                    # 分级理由
-                    reason: str = str(
-                        scored.get("read_reason", "") if scored else paper.get("read_reason", "")
-                    )
-
-                    paper_rows.append({
-                        "标题": title,
-                        "来源": str(paper.get("source", "")),
-                        "年份": str(paper.get("year", "")),
-                        "检索分": str(paper.get("score", "")),
-                        "相关度": score_display,
-                        "阅读等级": level_badge,
-                        "分级理由": reason[:60] + ("..." if len(reason) > 60 else ""),
-                    })
-                st.dataframe(paper_rows, use_container_width=True)
-
-                # ========== 三级文献分级精读：逐篇展示分级理由详情 ==========
-                if rated_papers:
-                    st.markdown("**分级理由详情**")
-                    for rp in rated_papers:
-                        rp_title: str = str(rp.get("title", "未知"))
-                        rp_score: float = float(rp.get("relevance_score", 0.0))
-                        rp_level: str = str(rp.get("read_level", "coarse"))
-                        rp_reason: str = str(rp.get("read_reason", "无理由"))
-
-                        level_emoji: str
-                        if rp_level == "deep":
-                            level_emoji = "🔬"
-                        elif rp_level == "medium":
-                            level_emoji = "📖"
-                        else:
-                            level_emoji = "👀"
-
-                        st.caption(
-                            f"{level_emoji} **{rp_title[:60]}** | "
-                            f"相关度: `{rp_score:.1f}/10` | "
-                            f"等级: `{rp_level}` | "
-                            f"理由: {rp_reason}"
-                        )
-            else:
-                st.caption("（无检索论文记录）")
-
-            # 缺陷说明
-            if defect_type:
-                st.markdown(f"**缺陷类型**: `{defect_type}`")
-                st.markdown(f"**缺陷说明**: {log_entry.get('defect_desc', '无详细说明')}")
-
-            # 修正关键词建议
-            suggest_keywords: list[str] = log_entry.get("suggest_new_keywords", [])
-            if suggest_keywords:
-                st.markdown("**建议修正关键词**")
-                st.markdown(", ".join(f"🔑 `{kw}`" for kw in suggest_keywords))
-
-            # 文献摘要溯源
-            paper_summaries: list[dict[str, Any]] = log_entry.get("paper_summary_results", [])
-            if paper_summaries:
-                st.markdown("**文献摘要溯源**")
-                for ps in paper_summaries:
-                    st.caption(f"- {ps.get('title', '未知标题')}: {ps.get('summary', '无摘要')}")
-
-    st.divider()
-    st.caption("以上审计日志由 Observer 模块自动生成，用于追踪检索质量与纠偏闭环决策。")
-
-
 with st.sidebar:
     st.markdown("### DeepResearch Pro")
     st.caption("Login-aware research client")
@@ -583,20 +373,10 @@ else:
                 st.rerun()
             except Exception as exc:
                 st.error(str(exc))
-
-    # ========== Observer审计纠偏闭环：Tab页切换 ==========
-    # Tab 1: Chat - 原有对话界面
-    # Tab 2: Audit Logs - Observer审计日志可视化
-    chat_tab, audit_tab = st.tabs(["💬 Chat", "📋 Audit Logs"])
-
-    with chat_tab:
-        if st.session_state.messages:
-            render_message_history()
-        else:
-            st.info("Start a new chat or open one from the sidebar.")
-
-    with audit_tab:
-        render_audit_logs_tab()
+    if st.session_state.messages:
+        render_message_history()
+    else:
+        st.info("Start a new chat or open one from the sidebar.")
 
 
 if st.session_state.current_user and (user_input := st.chat_input("Describe your research task...")):

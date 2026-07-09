@@ -5,10 +5,13 @@ import operator
 import os
 import re
 import time
-from typing import Annotated, Any, List, Optional
+from typing import Annotated, Any, List
 from uuid import uuid4
 
 from typing_extensions import TypedDict
+
+# ★ 全局 LLM 推理超时限制：防止大模型卡死无限等待，避免线上接口超时崩溃
+LLM_TIMEOUT = 15  # ★ 全局LLM推理超时15s，防止大模型卡死导致接口超时
 
 from conversation_memory import (
     load_recent_turn_memories,
@@ -16,12 +19,8 @@ from conversation_memory import (
     search_turn_memories,
     store_turn_memory,
 )
-from research_harness import build_execution_plan, build_structured_request
+from research_harness import build_execution_plan, build_structured_request, _extract_topic
 from storage import build_agent_checkpointer
-
-from observer_audit import AuditRecord
-from observer_audit import audit_and_correct
-from observer_audit import PaperItem  # 三级文献分级精读：论文打分类型
 
 _CHECKPOINTER_STACK = contextlib.ExitStack()
 atexit.register(_CHECKPOINTER_STACK.close)
@@ -40,33 +39,6 @@ class AgentState(TypedDict):
     past_steps: Annotated[List[str], operator.add]
     messages: Annotated[List[Any], operator.add]
     metrics: Annotated[dict, operator.ior]
-    # ========== Observer审计纠偏闭环新增状态字段 ==========
-    # audit_logs: 累积存储每轮Observer审计的结构化日志，不使用reducer，
-    # 由 observer_node 通过 audit_and_correct 返回完整列表直接覆盖。
-    audit_logs: List[dict]
-    # current_defect: 当前轮次Observer检测到的缺陷类型
-    #   - missing_info: 文献数量不足或覆盖领域不全
-    #   - view_conflict: 多篇论文核心结论互相矛盾
-    #   - outdated: 绝大多数文献年份过旧
-    #   - None: 本轮检索结果无缺陷
-    current_defect: Optional[str]
-    # suggest_keywords: Observer建议的修正/补充检索关键词，
-    # 在重规划时由 planner_node 注入prompt用于生成更精准的检索计划。
-    suggest_keywords: List[str]
-    # need_replan: Observer判定是否需要触发重规划闭环。
-    # True → route_after_observer 路由回 planner；False → 进入 synthesizer。
-    need_replan: bool
-    # max_replan_times: 最大重规划次数上限（默认3），防止死循环。
-    max_replan_times: int
-    # current_replan_round: 当前已执行的重规划轮次计数器，
-    # 每次触发重规划时 observer_node 自增1，达到 max_replan_times 后强制终止闭环。
-    current_replan_round: int
-    # ========== 三级文献分级精读：新增状态字段 ==========
-    # rated_papers: Observer 审计后对每篇论文的相关度打分与阅读等级建议，
-    # 由 audit_and_correct 返回，供 executor_read 分层精读节点消费。
-    # 每项为 PaperItem: {title, relevance_score(0-10), read_level(coarse/medium/deep), read_reason}
-    rated_papers: List[dict]
-
 
 
 SEARCH_RESULT_PATTERN = re.compile(
@@ -329,6 +301,91 @@ def _resolve_followup_paper_title(state: AgentState, user_input: str) -> str | N
         return deduped_titles[0]
     return None
 
+
+# ★★★ 全局复用：前置轻量黑名单过滤函数 ★★★
+# 匹配邮件、聊天等无关动作关键词，提前剥离无关文本再送入 planner，减少LLM冗余token
+_PRE_FILTER_BLACKLIST = re.compile(
+    r'(?:帮我|给我|替我|麻烦|请)(?:发(?:个|一封|一下)?(?:邮件|email|消息|微信|短信)|'
+    r'打(?:个)?(?:电话|语音)|写(?:个|一份)?(?:报告|周报|日报|总结|PPT)|'
+    r'做(?:个|一份)?(?:PPT|表格|文档|excel|word))|'
+    r'(?:先|首先|再|然后|顺便|另外|此外|还|也)(?:帮我|给我)?(?:发(?:邮件|消息|微信)|打(?:电话)|写(?:报告)|做(?:PPT))|'
+    r'发(?:个|一封|一下)?(?:邮件|email|消息|微信|短信)给',
+    re.IGNORECASE
+)
+
+def pre_filter_irrelevant_text(user_input: str) -> str:
+    """前置过滤：剥离邮件/聊天等无关动作文本，保留科研检索核心内容。"""
+    return _PRE_FILTER_BLACKLIST.sub('', user_input).strip()
+
+
+# ★★★ 全局复用：topic 深度清洗工具函数 ★★★
+def clean_core_topic(raw_topic: str) -> str:
+    """清洗 topic 字段冗余修饰文本，仅保留纯研究核心关键词。
+
+    自动过滤：角色扮演话术、地点场景干扰、无关前置动作、反问诱导语气、多余数量描述；
+    标准化特殊符号、分离粘连中英文、清理&/括号噪声。
+    仅用于 topic 字段，author/doi/paper_title/year 不调用此函数。
+    """
+    if not raw_topic or not raw_topic.strip():
+        return ""
+    t = raw_topic.strip()
+
+    # --- 第一层：删除四类干扰文本 ---
+    # 1. 角色扮演话术：假设你是XX专家、作为诺贝尔奖得主...
+    t = re.sub(r'(?:假设|如果|假如)(?:你|您)(?:是|身为|作为)[^，,。.；;]{2,30}?(?:[，,。.；;]|\s+)', '', t)
+    t = re.sub(r'(?:作为|身为|以)[^，,。.]{0,20}?(?:身份|角色|专家|得主|学者|研究者)', '', t)
+    # 2. 地点场景干扰：在上海的办公室里、在学校实验室...
+    t = re.sub(r'(?:在|从|于)\s*.{2,12}?(?:里|的办公室|办公室|家中|学校|实验室|公司|家里)(?:[，,。.]|\s+)', '', t)
+    # 3. 无关前置动作：先帮我发邮件给导师、然后搜...、顺便打电话...
+    t = re.sub(r'(?:先|首先|再|然后|顺便|另外|此外|还|也)\s*(?:帮我|给我|替我|为我)?\s*(?:发(?:邮件|消息|微信)|打(?:电话)|写(?:报告)|做(?:PPT|表格|文档)|查[看询]?|搜(?:索|寻)?|检索|找(?:到)?)[^，,。.]*[，,。.]?', '', t)
+    t = re.sub(r'(?:帮我|给我|替我|为我)\s*(?:发(?:邮件|消息|微信)给?[^，,。.]*|打(?:电话)给?[^，,。.]*|写(?:报告)[^，,。.]*|做(?:PPT|表格|文档))[，,。.]*', '', t)
+    # 4. 反问诱导语气：难道你不能帮我找...吗？、怎么不搜一下...
+    t = re.sub(r'^(?:难道|莫非|怎么|为啥|为什么)(?:你|您)?(?:不|没|不能|没法|没有).*?(?:吗|呢|吧)?[？?]?\s*', '', t)
+    t = re.sub(r'[？?!！]+[\s]*$', '', t)
+
+    # --- 第二层：删除多余数量描述 ---
+    t = re.sub(r'\b\d+\s*(?:篇|个|本|条|项|papers?|articles?|results?)\b', '', t)
+    t = re.sub(r'\b(?:several|some|a few|many|couple of)\s+(?:papers?|articles?|results?)\b', '', t)
+    t = re.sub(r'[一二两三四五六七八九十]+\s*(?:篇|个|本|条)', '', t)
+
+    # --- 第三层：标准化特殊符号 ---
+    t = t.replace('（', '(').replace('）', ')').replace('，', ',')
+    t = t.replace('：', ':').replace('；', ';').replace('！', '!').replace('？', '?')
+    t = re.sub(r'[–—−]', '-', t)  # 统一连字符
+    t = re.sub(r'\s*&\s*', ' & ', t)  # 标准化&符号
+
+    # --- 第四层：中英文粘连分离 ---
+    t = re.sub(r'([一-鿿])([A-Za-z0-9])', r'\1 \2', t)
+    t = re.sub(r'([A-Za-z0-9])([一-鿿])', r'\1 \2', t)
+
+    # --- 第五层：清理残留 ---
+    t = re.sub(r'\s+', ' ', t).strip()
+    t = t.strip(' ,.;:!?，。；：！？、')
+
+    # --- 第六层：兜底清理（来自 _clean_search_topic 逻辑）---
+    # 清理搜索请求包装词
+    t = re.sub(r'^(?:refer me to|suggest|suggest that|is a|is an)\s+', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'^(?:a|an|the)\s+', '', t, flags=re.IGNORECASE)
+    # 无效通用词回退
+    if t.lower() in {"paper", "papers", "research", "studies", "study", "resources", "tools"}:
+        return ""
+    return t or ""
+#===================新增翻译函数===============
+from langchain_core.messages import HumanMessage
+
+def translate_cn_topic_to_en(raw_cn_text: str, llm) -> str:
+    if not raw_cn_text or not raw_cn_text.strip():
+        return ""
+    prompt = f"""Translate this Chinese academic research topic into concise English search keywords.
+Only output translated English words, no explanations, no extra punctuation.
+Input: {raw_cn_text}
+Output:"""
+    resp = llm.invoke([HumanMessage(content=prompt)])
+    en_text = _stringify_content(resp.content).strip()
+    return en_text
+
+#============================================
+
 def create_research_agent():
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
     from langchain_openai import ChatOpenAI
@@ -340,11 +397,11 @@ def create_research_agent():
     api_key = os.getenv("OPENAI_API_KEY")
     base_url = os.getenv("OPENAI_API_BASE")
     planner_llm = ChatOpenAI(
-        model="qwen-plus",
+        model="qwen-turbo",
         temperature=0.1,
         openai_api_key=api_key,
         base_url=base_url,
-        request_timeout=60,
+        request_timeout=LLM_TIMEOUT,  # ★ 全局超时40s，防止大模型卡死
     )
     tools = [arxiv_research_tool, citation_stat_tool, query_research_db, summarize_paper_tool]
 
@@ -475,115 +532,101 @@ def create_research_agent():
     #=======================================
 
 
+#=====新增通用翻译工具函数=================
+    def translate_cn_topic_to_en(raw_cn_text: str, llm: ChatOpenAI) -> str:
+        """中文检索主题 → 精简英文检索关键词，仅输出纯英文名词短语，无多余解释"""
+        if not raw_cn_text or not raw_cn_text.strip():
+            return ""
+        prompt = f"""Translate this Chinese research topic into concise English search keywords, output ONLY the translated text, no extra words, no explanation.
+    Input: {raw_cn_text}
+    Output only English keywords:"""
+        resp = llm.invoke([HumanMessage(content=prompt)])
+        en_text = _stringify_content(resp.content).strip()
+        return en_text
+# =========================
+
     def planner_node(state: AgentState):
         start = time.time()
         raw_user_input = _get_latest_user_input(state)
-        planning_instruction = (
-            "【最高优先级强制规则：topic字段提纯规范，违反视为解析错误】\n"
-            "1. 提取topic时，仅保留纯研究核心名词/专业术语，**必须彻底删除所有口语修饰、量词、时间、动作助词**：\n"
-            "需删除词汇清单：帮我、检索、查找、有关、最新、最近、去年、数字、\\d+、篇、的论文、的文章、一下、那、几、次、下载、搜索、最、很、非常、hottest、latest、superlatives、demonstratives\n"
-            "2. 严格保留用户原始语言：中文提问只输出中文主题，英文提问只输出英文主题，严禁互相翻译；\n"
-            "3. 标准示例（严格模仿输出）：\n"
-            "用户输入：常温超导最火的那 3 篇 → topic='常温超导'\n"
-            "用户输入：the latest 5 papers on diffusion models → topic='diffusion models'\n"
-            "用户输入：最近关于大语言模型的最新研究 → topic='大语言模型'\n"
-            "用户输入：帮我检索一下最新的有关AI的论文 → topic='AI'\n"
-            "用户输入：找混合专家模型(MoE)的文献不要超过2篇 → topic='混合专家模型(MoE)'\n"
-            "4. 禁止在topic里保留动作、时间、数量、语气词，topic只能是纯科研关键词，不能是完整句子片段。\n\n"
-            "Allowed intents: search_papers, query_local_db, summarize_paper, citation_stats, clarify.\n"
-            "Return JSON with exactly these keys:\n"
-            '{"intent":"","topic":null,"paper_title":null,"author":null,"year":null,'
-            '"category":null,"citation_count":null,"count":null,"question":null,'
-            '"clarification_question":null,"ignored_intents":[]}\n'
-            "General Rules:\n"
-            "- Use null for missing fields.\n"
-            "- Do not invent paper titles, authors, years, categories, or citation thresholds.\n"
-            "- citation_count means the minimum desired citation threshold.\n"
-            "- If the user asks for recent or latest work, keep year as null unless the user gave an explicit year.\n"
-            "- Set category only when the user explicitly states an arXiv category or clearly names a canonical domain like NLP or computer vision.\n"
-            "- Preserve distinctive technical terminology/acronyms/method names ONLY (e.g. MoE, C++ & C#, Sora), do NOT preserve ordinary descriptive filler words.\n"
-            "- Do not collapse a narrow request into a broad field label. Keep specific method terms intact.\n"
-            "- Use query_local_db only when the user explicitly refers to local, indexed, downloaded, or vector-database content.\n"
-            "- If the request is mixed, keep the main research intent and place unrelated actions into ignored_intents.\n"
-            "- GUARDRAIL: When the user has not provided a clear research topic, paper title, author, or category, "
-            "do NOT generate a retrieval call (search_papers or citation_stats). Use intent=clarify instead. "
-            "This prevents wasteful tool calls with empty or meaningless search filters.\n"
-            "- GUARDRAIL: A valid topic must contain substantive keywords identifying a specific research area, "
-            "method, or subject (e.g., 'diffusion models', 'graph neural networks', '检索增强生成'). "
-            "Single generic words without a concrete subject (e.g., 'latest', 'recent', 'best', 'new') are NOT valid topics. "
-            "If the user only says '搜论文' or '找文献' without naming a subject, use intent=clarify.\n"
-            "- TOOL ROUTING RULE: When the user asks to compute citation statistics (average, sum, sort by citations) for N papers, "
-            "use intent=citation_stats. The execution plan will always use arxiv_research_tool FIRST to retrieve papers, "
-            "then citation_stat_tool SECOND to compute statistics. Never skip the retrieval step.\n"
-            "- TOOL ROUTING RULE: arxiv_research_tool only retrieves papers and reports per-paper citation_count. "
-            "It CANNOT compute averages or sums. citation_stat_tool handles all statistical computation.\n"
-            "- If the request is not actionable, use intent=clarify."
-        )
+        # ★ 前置黑名单过滤：剥离邮件/聊天等无关动作文本，减少LLM冗余token
+        raw_user_input = pre_filter_irrelevant_text(raw_user_input)
         memory_context = _format_recalled_memories(state.get("recalled_memories", []))
-        # ========== Observer审计纠偏闭环：注入上轮审计反馈 ==========
-        # 当 Observer 判定需要重规划时，从 state 中读取上轮缺陷描述和
-        # 建议的修正关键词，注入到 planner 的 prompt 中，引导生成更精准的检索计划。
-        audit_feedback_context: str = ""
-        current_defect: Optional[str] = state.get("current_defect")
-        suggest_keywords: List[str] = state.get("suggest_keywords", [])
-        if current_defect or suggest_keywords:
-            audit_feedback_context = "\n\n【Observer审计纠偏反馈 - 请根据以下问题重新规划检索】\n"
-            if current_defect:
-                audit_feedback_context += f"上轮检索缺陷类型: {current_defect}\n"
-            if suggest_keywords:
-                audit_feedback_context += (
-                    f"建议补充检索关键词: {', '.join(suggest_keywords)}\n"
-                    f"请在本次规划中优先使用上述关键词进行检索，弥补上轮文献覆盖不足的问题。\n"
-                )
-            audit_feedback_context += "请结合上述反馈重新生成 topic 和检索计划，确保文献覆盖面、时效性和一致性。\n"
-
-        response = planner_llm.invoke(
+        try:
+            response = planner_llm.invoke(
             [
                 SystemMessage(
                     content=(
-                        "HARD NON-NEGOTIABLE RULE:\n"
-                        "The topic field MUST remain Chinese.DO NOT translate Chinese keywords into English under any circumstance."
-                        "Do NOT automatically convert topic into English for arxiv API.The backend will handle translation automatically."
-                        "Any English value in topic will cause evaluation failure."
-                        "You are a research request normalizer for a tool-using research agent. "
-                        "Use conversation history and recalled memory only when needed to resolve references. "
-                        "Output one strict JSON object only and never add prose. "
-                        "Do not invent missing facts. "
-                        "When the user names a rare method, metric, architecture detail, or benchmark, keep it in topic instead of abstracting it away. "
-                        "ABSOLUTE RULE: topic must be Chinese raw text. Never translate Chinese words into English. The backend will translate for arxiv automatically.\n"
-                        "When extracting topic, strictly preserve the user's original language. Do not translate into English. Do not perform language conversion."
-                        "Strip noise modifiers from topic: remove superlatives (最火的, hottest, latest), counts (3篇, 5 papers), "
-                        "demonstratives (那, those), and filler words. Topic must be the pure research subject only. "
-                        "Example: input='常温超导最火的那 3 篇' → topic='常温超导'. "
-                        "TOOL ROUTING: arxiv_research_tool retrieves papers with per-paper citation_count — it CANNOT compute averages or sums. "
-                        "When the user requests citation statistics (average, sum, sort by citations), use intent=citation_stats. "
-                        "The system will then execute arxiv_research_tool first, followed by citation_stat_tool. "
-                        "Never call citation_stat_tool before arxiv_research_tool returns results. "
-                        "For any multi-paper statistical query, always plan retrieval before computation. "
-                        "GUARDRAIL: When the user has not provided a clear research topic, paper title, author, "
-                        "or category, use intent=clarify — never fabricate a topic or search with empty filters. "
-                        "A topic like 'latest', 'recent', or 'best' without a concrete subject is invalid and must trigger clarification."
+                        # ── 合并精简版 System Prompt（去重 planning_instruction，减少 token 消耗）──
+                        "You are a research request normalizer. Output one strict JSON object only, no markdown, no prose.\n"
+                        "Use conversation history / recalled memory only to resolve cross-turn references.\n"
+                        "\n"
+                        "=== LANGUAGE RULES (top priority) ===\n"
+                        "- English input → topic must be English keywords. NEVER translate to Chinese.\n"
+                        "- Chinese input → topic must be Chinese keywords. NEVER translate to English.\n"
+                        "- Never mix Chinese+English in one topic field.\n"
+                        "- Topic = pure research core terms only. Strip ALL noise: superlatives(最火/hottest/latest), counts(3篇/5 papers), demonstratives(那/those), filler(帮我/检索/find/search for).\n"
+                        "- Examples: \"常温超导最火的3篇\"→topic=\"常温超导\" | \"latest 5 papers on diffusion models\"→topic=\"diffusion models\" | \"找MoE文献不超过2篇\"→topic=\"混合专家模型(MoE)\"\n"
+                        "- Keep rare technical terms intact: MoE, C++, Sora, specific methods/metrics/benchmarks.\n"
+                        "\n"
+                        "=== FIELD EXTRACTION RULES ===\n"
+                        "- topic: pure keywords stripped of author/year/DOI/title/time. null if no clear subject.\n"
+                        "- paper_title: only if user gives exact quoted/bookmarked title, else null.\n"
+                        "- author: only if user explicitly names one, else null. Never guess.\n"
+                        "- year: only explicit year (2023/2024). Relative time(最近/去年)→time_range, year=null.\n"
+                        "- time_range: e.g. 近三年→2023-2025. null if not specified.\n"
+                        "- doi: only if user gives explicit DOI, else null.\n"
+                        "- category: only if user names arXiv category or canonical domain(NLP/CV/ML), else null.\n"
+                        "- citation_count: min citation threshold, null if not specified.\n"
+                        "- Never invent paper titles, authors, years, DOIs, or categories.\n"
+                        "\n"
+                        "=== INTENTS: search_papers | query_local_db | summarize_paper | citation_stats | clarify ===\n"
+                        "- query_local_db: only when user says local/indexed/vector-database/已下载.\n"
+                        "- summarize_paper: only when user gives paper title + summary/overview/总结 intent.\n"
+                        "- citation_stats: when user asks avg/sum/sort by citations. Always retrieval first, then computation.\n"
+                        "- clarify: no clear topic/title/author/category → clarify. Vague words alone(latest/recent/最新/最近) without concrete subject → clarify.\n"
+                        "- Mixed request: keep main research intent, put unrelated actions into ignored_intents.\n"
+                        "\n"
+                        "=== OUTPUT JSON SCHEMA ===\n"
+                        '{"intent":"","topic":null,"paper_title":null,"author":null,"year":null,"doi":null,"time_range":null,"category":null,"citation_count":null,"count":null,"question":"","clarification_question":null,"ignored_intents":[]}'
                     )
                 ),
                 HumanMessage(
                     content=(
                         f"recent_dialogue:\n{_format_recent_dialogue(state.get('messages', []), limit=4)}\n\n"
                         f"recalled_memory_context:\n{memory_context}\n\n"
-                        f"{planning_instruction}\n\n"
                         f"user_request: {raw_user_input}"
-                        f"{audit_feedback_context}"
                     )
                 ),
             ]
         )
+        except Exception:
+            # LLM 调用失败时兜底：返回 clarify，让前端正常展示而非报错
+            return {
+                "normalized_request": build_structured_request(raw_user_input, {}),
+                "approved_plan": [{"step_type": "respond", "content": "抱歉，请求处理超时，请重试。"}],
+                "risk_flags": ["planner_llm_failed"],
+                "final_mode": "passthrough",
+                "metrics": {"01_Planner_Logic": round(time.time() - start, 2)},
+            }
 
         planner_payload = _parse_json_object(getattr(response, "content", response))
 
+        # ★ DEBUG：完整打印所有独立抽取字段，方便调试核对抽取结果
+        print(f"[DEBUG] planner_payload → intent={planner_payload.get('intent')} | "
+              f"topic={planner_payload.get('topic')!r} | "
+              f"paper_title={planner_payload.get('paper_title')!r} | "
+              f"author={planner_payload.get('author')!r} | "
+              f"year={planner_payload.get('year')!r} | "
+              f"doi={planner_payload.get('doi')!r} | "
+              f"time_range={planner_payload.get('time_range')!r} | "
+              f"category={planner_payload.get('category')!r} | "
+              f"citation_count={planner_payload.get('citation_count')!r} | "
+              f"count={planner_payload.get('count')!r}")
+
         # ======================================
-        # 强制锁死topic：仅中文问句才提纯覆盖；纯英文输入保持原样不变
-        has_chinese_char = re.search(r'[\u4e00-\u9fff]', raw_user_input)
-        if planner_payload.get("topic") and has_chinese_char:
-            planner_payload["topic"] = extract_core_chinese_subject(raw_user_input)
+        # ★ 新增：对所有 topic 执行全局文本清洗（四类干扰过滤+符号标准化）
+        if planner_payload.get("topic"):
+            planner_payload["topic"] = clean_core_topic(planner_payload["topic"])  # ★ 全局清洗函数
         # =======================================
 
         normalized_request = build_structured_request(raw_user_input, planner_payload)
@@ -625,6 +668,39 @@ def create_research_agent():
             "cleaned_topic": normalized_request.get("topic")
         }
 
+    # ★★★ 新增：空有效主题前置拦截函数 ★★★
+    # 在 arxiv 工具调用前校验检索参数，无有效 topic 时直接返回提示，不发起 arxiv 检索
+    def _validate_search_topic(topic: str | None, paper_title: str | None, author: str | None, category: str | None) -> str | None:
+        """前置拦截校验：识别无有效检索主题时返回提示消息；验证通过则返回 None。"""
+        _topic = str(topic or "").strip()
+        _paper_title = str(paper_title or "").strip()
+        _author = str(author or "").strip()
+        _category = str(category or "").strip()
+
+        # 拦截1：所有检索条件均为空/空白
+        if not any([_topic, _paper_title, _author, _category]):
+            return (
+                "I cannot execute a retrieval call because no research topic, paper title, author, "
+                "or category was specified. Please provide a clear research topic (e.g., a specific "
+                "method, domain, or paper title) so I can search effectively."
+            )
+
+        # 拦截2：topic 仅含模糊停用词，无实质检索意义
+        _VAGUE_STOPWORDS = {
+            "latest", "recent", "new", "newest", "best", "top", "good",
+            "最新", "最近", "最好", "最火", "顶尖", "热门",
+            "research", "paper", "papers", "study", "studies",
+        }
+        topic_tokens = set(_topic.lower().split())
+        if _topic and topic_tokens.issubset(_VAGUE_STOPWORDS):
+            return (
+                f"The topic '{_topic}' is too vague for a meaningful literature search. "
+                "Please specify a concrete research area, method, or subject "
+                "(e.g., 'retrieval-augmented generation', 'graph neural networks', 'reinforcement learning')."
+            )
+
+        return None  # 校验通过
+
     def executor_node(state: AgentState):
         start = time.time()
         current_step = state["approved_plan"][0]
@@ -637,52 +713,57 @@ def create_research_agent():
                 "metrics": {"02_Executor_Thought": round(time.time() - start, 2)},
             }
 
-        # ===== Parameter validation: abort if no actionable search criteria =====
+        # ★★★ 修改：调用前置拦截函数，替代原有内联校验 ★★★
         _SEARCH_TOOLS = {"arxiv_research_tool", "query_research_db"}
         tool_name = current_step["tool_name"]
         if tool_name in _SEARCH_TOOLS:
-            topic = str(current_step.get("args", {}).get("topic") or "").strip()
-            paper_title = str(current_step.get("args", {}).get("paper_title") or "").strip()
-            author = str(current_step.get("args", {}).get("author") or "").strip()
-            category = str(current_step.get("args", {}).get("category") or "").strip()
-            question = str(current_step.get("args", {}).get("question") or "").strip()
+            args = current_step.get("args", {})
+            intercept_msg = _validate_search_topic(
+                topic=args.get("topic"),
+                paper_title=args.get("paper_title"),
+                author=args.get("author"),
+                category=args.get("category"),
+            )
+            if intercept_msg is not None:  # 拦截命中：尝试启发式回退提取topic
+                raw_input = _get_latest_user_input(state)
+                fallback_topic = _extract_topic(raw_input)
+                if fallback_topic:
+                    fallback_topic = clean_core_topic(fallback_topic)
+                    recheck = _validate_search_topic(
+                        topic=fallback_topic,
+                        paper_title=args.get("paper_title"),
+                        author=args.get("author"),
+                        category=args.get("category"),
+                    )
+                    if recheck is None:
+                        # 启发式回退成功，使用新topic继续检索
+                        print(f"[FALLBACK] 启发式回退提取到有效topic: {fallback_topic!r}")
+                        current_step["args"]["topic"] = fallback_topic
+                        intercept_msg = None  # 清除拦截，继续执行检索
+                if intercept_msg is not None:
+                    return {
+                        "messages": [AIMessage(content=intercept_msg)],
+                        "final_mode": "passthrough",
+                        "metrics": {"02_Executor_Thought": round(time.time() - start, 2)},
+                    }
 
-            # All search criteria are empty / whitespace → abort
-            if not any([topic, paper_title, author, category]):
-                return {
-                    "messages": [AIMessage(content=(
-                        "I cannot execute a retrieval call because no research topic, paper title, author, "
-                        "or category was specified. Please provide a clear research topic (e.g., a specific "
-                        "method, domain, or paper title) so I can search effectively."
-                    ))],
-                    "final_mode": "passthrough",
-                    "metrics": {"02_Executor_Thought": round(time.time() - start, 2)},
-                }
-
-            # Topic is semantically vague: too short / generic stopwords only
-            _VAGUE_STOPWORDS = {
-                "latest", "recent", "new", "newest", "best", "top", "good",
-                "最新", "最近", "最好", "最火", "顶尖", "热门",
-                "research", "paper", "papers", "study", "studies",
+        # ★ P0修复：intent=clarify 或无有效 topic 时终止流程，禁止调用 arxiv_research_tool ★
+        normalized_intent = state.get("normalized_request", {}).get("intent", "")
+        if normalized_intent == "clarify" and tool_name in _SEARCH_TOOLS:
+            return {
+                "messages": [AIMessage(content=(
+                    "I need more specific information to conduct a meaningful literature search. "
+                    "Please provide a clear research topic, paper title, or author name."
+                ))],
+                "final_mode": "passthrough",
+                "metrics": {"02_Executor_Thought": round(time.time() - start, 2)},
             }
-            topic_tokens = set(topic.lower().split())
-            if topic and topic_tokens.issubset(_VAGUE_STOPWORDS):
-                return {
-                    "messages": [AIMessage(content=(
-                        f"The topic '{topic}' is too vague for a meaningful literature search. "
-                        "Please specify a concrete research area, method, or subject "
-                        "(e.g., 'retrieval-augmented generation', 'graph neural networks', 'reinforcement learning')."
-                    ))],
-                    "final_mode": "passthrough",
-                    "metrics": {"02_Executor_Thought": round(time.time() - start, 2)},
-                }
-        # ===== End parameter validation =====
 
-        # Per-tool allowed args whitelist
+        # Per-tool allowed args whitelist  ★ doi/time_range 加入白名单透传
         TOOL_ARG_WHITELIST: dict[str, set[str]] = {
             "arxiv_research_tool": {
-                "question", "topic", "paper_title", "author", "year",
-                "category", "category_strict", "citation_count", "count",
+                "question", "topic", "paper_title", "doi", "author", "year",
+                "time_range", "category", "category_strict", "citation_count", "count",
                 "sort_mode", "rewrite_limit", "min_relevance_score"
             },
             "citation_stat_tool": {
@@ -709,31 +790,29 @@ def create_research_agent():
 
         print(f"[DEBUG] 过滤后 args: {filtered_args}")
 
-        # 从状态里拿到planner已经清洗完毕的topic
+        # ★★★ 核心打通修复：优先复用 planner 已清洗字段，禁止重新从 question 提取脏 topic ★★★
         cleaned_topic = state.get("cleaned_topic")
-
-        # 只在topic不为空时强制覆盖
         if cleaned_topic:
-            filtered_args["topic"] = cleaned_topic
+            filtered_args["topic"] = cleaned_topic  # 使用 planner 清洗后的干净 topic
+            # 同步透传 planner 产出的独立字段（doi/time_range/author/year/paper_title）
+            normalized_req = state.get("normalized_request", {})
+            for _key in ("doi", "time_range", "author", "year", "paper_title"):
+                _val = normalized_req.get(_key)
+                if _val and _key in allowed:
+                    filtered_args[_key] = _val
 
-        raw_text = state["messages"][-1].content
+        # ★ P0修复：count 上限截断，超过全局 MAX_SEARCH_LIMIT 自动截断 ★
+        from research_harness import MAX_SEARCH_LIMIT
+        _raw_count = filtered_args.get("count")
+        if _raw_count is not None and int(_raw_count) > MAX_SEARCH_LIMIT:
+            print(f"[INTERCEPT] count={_raw_count} > MAX_SEARCH_LIMIT={MAX_SEARCH_LIMIT}，已自动截断")
+            filtered_args["count"] = MAX_SEARCH_LIMIT
 
-
-        def extract_core_chinese_subject(query: str) -> str:
-            # 先删除所有干扰语句、量词、修饰词
-            noise = r"\d+|一次性|下载|篇|帮我|搜索|查找|关于|的论文|的文章|最近|最新|最火"
-            text = re.sub(noise, "", query)
-            # 只保留连续中文汉字
-            all_chinese = re.findall(r'[\u4e00-\u9fff]+', text)
-            # 拼接纯主题名词
-            raw_topic = "".join(all_chinese).strip()
-            return raw_topic
-
-        # 拿到用户原始提问
-        raw_question = state["messages"][-1].content
-        # 仅中文问句执行覆盖
-        if re.search(r'[\u4e00-\u9fff]', raw_question):
-            filtered_args["topic"] = extract_core_chinese_subject(raw_question)
+        # ★ DEBUG：打印最终下游 args，确认 topic/author/year/doi 与 planner 输出一致 ★
+        print(f"[DEBUG] executor 最终 args → topic={filtered_args.get('topic')!r} | "
+              f"author={filtered_args.get('author')!r} | year={filtered_args.get('year')!r} | "
+              f"doi={filtered_args.get('doi')!r} | time_range={filtered_args.get('time_range')!r} | "
+              f"count={filtered_args.get('count')!r} | paper_title={filtered_args.get('paper_title')!r}")
 
         tool_call = {
             "name": current_step["tool_name"],
@@ -751,20 +830,11 @@ def create_research_agent():
         tool_output = ToolNode(tools).invoke(state)
         return {**tool_output, "metrics": {"03_Tools_IO": round(time.time() - start, 2)}}
 
-    # ========== Observer审计纠偏闭环：observer_node ==========
-    # 该节点在每次工具调用返回后执行，承担两个职责：
-    # 1. 记录已完成步骤的摘要（past_steps），供 synthesizer 汇总使用。
-    # 2. 当计划中所有步骤执行完毕后，调用 audit_and_correct 对检索结果
-    #    进行质量审计，判定是否存在 missing_info / view_conflict / outdated 缺陷。
-    #    若审计发现缺陷且未超过 max_replan_times，则触发闭环 → 回到 planner 重规划；
-    #    否则进入 synthesizer 生成最终回答。
     def observer_node(state: AgentState):
-        start = time.time()
         current_step = state["approved_plan"][0] if state.get("approved_plan") else None
         remaining_plan = state["approved_plan"][1:] if state.get("approved_plan") else []
         last_message = state["messages"][-1]
 
-        # --- 记录已完成的步骤结果（保留原有逻辑） ---
         if isinstance(last_message, ToolMessage):
             tool_name = current_step["tool_name"] if current_step else "tool"
             snapshot = _truncate_text(getattr(last_message, "content", ""), 1500)
@@ -774,178 +844,7 @@ def create_research_agent():
         else:
             past_steps = []
 
-        # 如果计划还有剩余步骤，继续交给 executor 执行，暂不触发审计
-        if remaining_plan:
-            return {
-                "past_steps": past_steps,
-                "approved_plan": remaining_plan,
-                "metrics": {"03_Observer": round(time.time() - start, 2)},
-            }
-
-        # --- 计划全部执行完毕，启动 Observer 审计纠偏闭环 ---
-        # 从状态中提取审计所需的上下文信息
-        raw_user_query: str = _get_latest_user_input(state)
-        normalized_request: dict[str, Any] = state.get("normalized_request", {})
-        planner_search_keywords: List[str] = (
-            [normalized_request.get("topic", "")]
-            if normalized_request.get("topic") else []
-        )
-
-        # 从最近的工具输出中解析检索到的论文列表
-        tool_output: str = _latest_tool_output(state.get("messages", []))
-        retrieved_papers: List[dict] = _parse_search_results(tool_output)
-
-        # 论文摘要结果（从工具输出提取标题作为摘要占位）
-        paper_summaries: List[dict] = [
-            {"title": p.get("title", ""), "summary": p.get("summary_hint", "")}
-            for p in retrieved_papers
-        ]
-
-        # 获取当前重规划轮次计数，检查是否超过上限
-        current_replan_round: int = state.get("current_replan_round", 0)
-        max_replan_times: int = state.get("max_replan_times", 3)
-
-        # 构建审计状态字典，调用 observer_audit 模块的 audit_and_correct
-        audit_state: dict[str, Any] = {
-            "raw_user_query": raw_user_query,
-            "planner_search_keywords": planner_search_keywords,
-            "retrieved_papers": retrieved_papers,
-            "paper_summaries": paper_summaries,
-            "standard_task_type": normalized_request.get("intent", "search_papers"),
-            "audit_logs": state.get("audit_logs", []),
-        }
-
-        audit_result: dict[str, Any] = audit_and_correct(audit_state)
-
-        # 检查重规划次数限制，防止死循环
-        need_replan: bool = audit_result.get("need_replan", False)
-        if need_replan and current_replan_round >= max_replan_times:
-            need_replan = False  # 达到上限，强制终止闭环
-
-        # 重规划轮次自增（仅在确实触发重规划时）
-        next_replan_round: int = current_replan_round + 1 if need_replan else current_replan_round
-
-        return {
-            "past_steps": past_steps,
-            "approved_plan": remaining_plan,
-            "audit_logs": audit_result.get("audit_logs", []),
-            "current_defect": audit_result.get("current_defect"),
-            "suggest_keywords": audit_result.get("suggest_keywords", []),
-            "need_replan": need_replan,
-            "current_replan_round": next_replan_round,
-            # ========== 三级文献分级精读：传递打分结果 ==========
-            "rated_papers": audit_result.get("rated_papers", []),
-            "metrics": {"03_Observer_Audit": round(time.time() - start, 2)},
-        }
-
-    # ========== 三级文献分级精读：executor_read 分层精读节点 ==========
-    # 当 Observer 审计通过（无缺陷）时，根据 rated_papers 中每篇论文的
-    # read_level（coarse/medium/deep）使用不同 Prompt 策略进行分层精读：
-    #   - coarse（粗读）: 1-2句核心概述
-    #   - medium（中度）: 结构化摘要（目的、方法、关键发现）
-    #   - deep（深度）: 综合分析（背景、方法、实验、结论、局限性、未来方向）
-    # 精读结果注入 past_steps，供 synthesizer 整合为最终回答。
-    def executor_read_node(state: AgentState):
-        start = time.time()
-        rated_papers: List[dict] = state.get("rated_papers", []) or []
-
-        if not rated_papers:
-            # 无分级论文时直接透传，不阻塞流程
-            return {
-                "past_steps": ["[executor_read] 无待精读论文"],
-                "metrics": {"03b_Executor_Read": round(time.time() - start, 2)},
-            }
-
-        # ---- 三级分层阅读 Prompt 模板 ----
-        COARSE_PROMPT: str = (
-            "你是一位科研文献速读助手。请用1-2句话极其精炼地概括以下论文的核心内容，"
-            "不需要详细展开。\n论文标题: {title}\n论文元数据: {metadata}\n"
-            "请仅输出中文概述:"
-        )
-        MEDIUM_PROMPT: str = (
-            "你是一位科研文献结构化阅读助手。请按以下格式总结论文:\n"
-            "1. 研究目的\n2. 方法\n3. 关键发现\n"
-            "论文标题: {title}\n论文元数据: {metadata}\n"
-            "请仅输出结构化摘要:"
-        )
-        DEEP_PROMPT: str = (
-            "你是一位资深科研评审专家。请对该论文进行深度综合分析，按以下维度输出:\n"
-            "1. 研究背景与动机\n2. 核心方法/技术创新\n3. 实验设计与关键结果\n"
-            "4. 主要结论与贡献\n5. 局限性\n6. 未来研究方向\n"
-            "论文标题: {title}\n论文元数据: {metadata}\n"
-            "请输出深度分析报告:"
-        )
-
-        read_results: list[str] = []
-        for paper in rated_papers:
-            title: str = str(paper.get("title", "未知标题"))
-            read_level: str = str(paper.get("read_level", "coarse")).lower()
-            relevance_score: float = float(paper.get("relevance_score", 0.0))
-            read_reason: str = str(paper.get("read_reason", ""))
-
-            # 构建论文元数据字符串
-            metadata_parts: list[str] = []
-            for key in ("source", "year", "score"):
-                val = paper.get(key)
-                if val:
-                    metadata_parts.append(f"{key}={val}")
-            metadata_str: str = ", ".join(metadata_parts) if metadata_parts else "无额外元数据"
-
-            # 根据阅读等级选择对应 Prompt
-            level_label: str
-            if read_level == "deep":
-                prompt_template = DEEP_PROMPT
-                level_label = "深度"
-            elif read_level == "medium":
-                prompt_template = MEDIUM_PROMPT
-                level_label = "中度"
-            else:
-                prompt_template = COARSE_PROMPT
-                level_label = "粗读"
-
-            filled_prompt: str = prompt_template.format(title=title, metadata=metadata_str)
-
-            try:
-                read_response = planner_llm.invoke([
-                    SystemMessage(content="You are a precise academic literature reader. Output in Chinese."),
-                    HumanMessage(content=filled_prompt),
-                ])
-                summary_text: str = _stringify_content(getattr(read_response, "content", read_response))
-            except Exception:
-                summary_text = f"[读取失败] {title}"
-
-            # 标注阅读等级和相关度分数
-            tagged_summary: str = (
-                f"[{level_label}精读 | 相关度={relevance_score:.1f}/10 | {read_reason}]\n"
-                f"**{title}**\n{summary_text}"
-            )
-            read_results.append(tagged_summary)
-
-        return {
-            "past_steps": read_results,
-            "metrics": {"03b_Executor_Read": round(time.time() - start, 2)},
-        }
-
-    # ========== Observer审计后路由函数 ==========
-    # 决定 observer_node 执行后的下一个节点：
-    # - need_replan=True 且未超限 → 回到 planner 重新生成检索计划（闭环）
-    # - need_replan=False 且有 rated_papers → 进入 executor_read 分层精读
-    # - 计划还有剩余步骤 → 回到 executor 继续执行
-    # - 计划执行完毕且无需重规划无精读 → 进入 synthesizer 生成最终答案
-    def route_after_observer(state: AgentState) -> str:
-        # Observer审计纠偏闭环：需要重规划则回到planner
-        if state.get("need_replan", False):
-            return "planner"
-        # 计划中还有未执行的步骤，继续交给executor
-        if state.get("approved_plan"):
-            return "executor"
-        # ========== 三级文献分级精读路由分支 ==========
-        # 无缺陷但有打分论文 → 进入分层精读节点
-        rated: list = state.get("rated_papers", []) or []
-        if rated and not state.get("need_replan", False):
-            return "executor_read"
-        # 所有步骤完成且无需重规划，进入综合节点
-        return "synthesizer"
+        return {"past_steps": past_steps, "approved_plan": remaining_plan}
 
     def synthesizer_node(state: AgentState):
         start = time.time()
@@ -1065,19 +964,12 @@ def create_research_agent():
         )
         return {"metrics": {"05_Memory_Write": round(time.time() - start, 2)}}
 
-    # ========== LangGraph 工作流构建：Observer审计纠偏闭环 + 三级文献分级精读 ==========
-    # 流程: memory_router → planner → executor(仅拉取元数据) → tools → observer_audit
-    #       observer_audit ──need_replan→ planner（闭环重规划）
-    #       observer_audit ──remaining→ executor（继续执行计划步骤）
-    #       observer_audit ──无缺陷+有rated_papers→ executor_read（分层精读）
-    #       executor_read → synthesizer → memory_writer → END
     workflow = StateGraph(AgentState)
     workflow.add_node("memory_router", memory_router_node)
     workflow.add_node("planner", planner_node)
     workflow.add_node("executor", executor_node)
     workflow.add_node("tools", timed_tool_node)
     workflow.add_node("observer", observer_node)
-    workflow.add_node("executor_read", executor_read_node)  # 三级文献分级精读节点
     workflow.add_node("synthesizer", synthesizer_node)
     workflow.add_node("memory_writer", memory_writer_node)
 
@@ -1086,13 +978,7 @@ def create_research_agent():
     workflow.add_conditional_edges("planner", lambda state: "executor" if state["approved_plan"] else "synthesizer")
     workflow.add_conditional_edges("executor", lambda state: "tools" if state["messages"][-1].tool_calls else "observer")
     workflow.add_edge("tools", "observer")
-    # Observer审计纠偏闭环 + 三级文献分级精读路由：
-    #   - need_replan=True → planner（闭环：重新生成检索关键词和计划）
-    #   - approved_plan非空 → executor（继续执行剩余步骤）
-    #   - 无缺陷且rated_papers非空 → executor_read（分层精读）
-    #   - 否则 → synthesizer（进入最终答案生成）
-    workflow.add_conditional_edges("observer", route_after_observer)
-    workflow.add_edge("executor_read", "synthesizer")  # 精读完成后进入综合
+    workflow.add_conditional_edges("observer", lambda state: "executor" if state["approved_plan"] else "synthesizer")
     workflow.add_edge("synthesizer", "memory_writer")
     workflow.add_edge("memory_writer", END)
 

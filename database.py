@@ -1,12 +1,20 @@
 import os
 from dotenv import load_dotenv
+from functools import lru_cache
+from langchain_huggingface import HuggingFaceEmbeddings  # 修复: langchain_community已废弃，改用langchain_huggingface
+from langchain_chroma import Chroma
 
 load_dotenv()  # 顶部提前加载环境变量
 
+DATA_DIR = "./research_papers"
+DB_DIR = os.getenv("VECTOR_DB_DIR", "./vector_db_storage")
 
+for directory in (DATA_DIR, DB_DIR):
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+@lru_cache(maxsize=1)
 def get_vector_db():
-    from langchain_community.embeddings import HuggingFaceEmbeddings
-    from langchain_chroma import Chroma
 
     # 读取本地BGE模型路径，兜底移除MiniLM
     model_path = os.getenv("EMBEDDING_MODEL_PATH")
@@ -28,8 +36,3 @@ def get_vector_db():
     DB_DIR = os.getenv("VECTOR_DB_DIR")
     db = Chroma(persist_directory=DB_DIR, embedding_function=embeddings)
     return db, embeddings
-
-
-db, emb = get_vector_db()
-test_vec = emb.embed_query("测试文本")
-print("向量维度：", len(test_vec)) # 输出512即正确

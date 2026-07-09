@@ -6,6 +6,7 @@ from typing import Any
 
 DEFAULT_COUNT = 3
 MAX_COUNT = 10
+MAX_SEARCH_LIMIT = 10  # ★ 全局统一最大检索数量，替代硬编码10，超大count自动截断
 MAX_CITATION_COUNT = 100000
 CURRENT_YEAR = datetime.utcnow().year
 DEFAULT_SORT_MODE = "relevance_then_recency"
@@ -220,17 +221,21 @@ def build_structured_request(raw_query: str, planner_payload: dict | None = None
             topic = _fallback_topic_from_filters(author, category, year)
         # Preserve the original intent (citation_stats vs search_papers) for execution plan routing
         resolved_intent = "citation_stats" if cleaned_payload["intent"] == "citation_stats" else "search_papers"
+        # ★ count 上限截断，使用全局统一常量
+        bounded_count = min(count, MAX_SEARCH_LIMIT)
         return {
             "intent": resolved_intent,
             "question": query,
             "topic": topic,
             "paper_title": paper_title,
+            "doi": cleaned_payload["doi"],            # ★ 透传DOI
+            "time_range": cleaned_payload["time_range"],  # ★ 透传时间范围
             "author": author,
             "year": year,
             "category": category,
             "category_strict": bool(explicit_category),
             "citation_count": citation_count,
-            "count": count,
+            "count": bounded_count,
             "sort_mode": sort_mode,
             "rewrite_limit": rewrite_limit,
             "min_relevance_score": min_relevance_score,
@@ -381,6 +386,8 @@ def _normalize_planner_payload(payload: dict) -> dict:
         "topic": _clean_optional_text(payload.get("topic")),
         "paper_title": _clean_optional_text(payload.get("paper_title")),
         "author": _clean_optional_text(payload.get("author")),
+        "doi": _clean_optional_text(payload.get("doi")),        # ★ 新增独立DOI字段
+        "time_range": _clean_optional_text(payload.get("time_range")),  # ★ 新增时间范围字段
         "question": _clean_optional_text(payload.get("question")),
         "clarification_question": _clean_optional_text(payload.get("clarification_question")),
         "category": _clean_optional_text(payload.get("category")),

@@ -15,7 +15,10 @@ MAX_MEMORY_CANDIDATES = 24
 HIGH_IMPORTANCE_THRESHOLD = 0.80
 MID_IMPORTANCE_THRESHOLD = 0.55
 
+from dotenv import load_dotenv
+load_dotenv()
 
+# print(os.getenv("OPENAI_MODEL"))
 def _connect():
     ensure_structured_storage_ready()
     return get_structured_store_engine().connect()
@@ -32,7 +35,8 @@ def _make_memory_llm() -> ChatOpenAI | None:
     base_url = os.getenv("OPENAI_API_BASE")
     if not api_key or not base_url:
         return None
-    model = os.getenv("OPENAI_MEMORY_MODEL") or os.getenv("OPENAI_MODEL") or "Qwen/Qwen2.5-7B-Instruct"
+    # model = os.getenv("OPENAI_MEMORY_MODEL") or os.getenv("OPENAI_MODEL") or "Qwen/Qwen2.5-7B-Instruct"
+    model = "qwen-turbo"
     return ChatOpenAI(model=model, temperature=0, openai_api_key=api_key, base_url=base_url, request_timeout=45)
 
 

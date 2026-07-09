@@ -10,7 +10,7 @@ from langchain_core.documents import Document
 from pypdf import PdfReader
 from sqlalchemy import text
 
-from database import DATA_DIR, get_vector_db
+from database import DATA_DIR,get_vector_db
 from research_harness import CURRENT_YEAR
 from storage import ensure_structured_storage_ready, get_structured_store_engine, now_utc_timestamp
 

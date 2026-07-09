@@ -870,27 +870,65 @@ def list_chat_messages_for_user(user_id: str, thread_id: str, limit: int = 200) 
 
 
 def build_agent_checkpointer(exit_stack: contextlib.ExitStack):
-    backend = get_storage_backend()
-    if backend == STORAGE_BACKEND_POSTGRES:
-        try:
-            from langgraph.checkpoint.postgres import PostgresSaver
-        except ModuleNotFoundError as exc:
-            raise RuntimeError(
-                "STORAGE_BACKEND=postgresql requires `langgraph-checkpoint-postgres` "
-                "and `psycopg[binary]` in the runtime environment."
-            ) from exc
+    #===================原代码===========================
+    # backend = get_storage_backend()
+    # if backend == STORAGE_BACKEND_POSTGRES:
+    #     try:
+    #         from langgraph.checkpoint.postgres import PostgresSaver
+    #     except ModuleNotFoundError as exc:
+    #         raise RuntimeError(
+    #             "STORAGE_BACKEND=postgresql requires `langgraph-checkpoint-postgres` "
+    #             "and `psycopg[binary]` in the runtime environment."
+    #         ) from exc
+    #
+    #     checkpointer = exit_stack.enter_context(
+    #         PostgresSaver.from_conn_string(_normalized_database_url())
+    #     )
+    #     checkpointer.setup()
+    #     return checkpointer
+    #
+    # sqlite_path = get_sqlite_checkpoint_path()
+    # _ensure_parent_dir(sqlite_path)
+    # connection = exit_stack.enter_context(
+    #     contextlib.closing(sqlite3.connect(sqlite_path, check_same_thread=False))
+    # )
+    # from langgraph.checkpoint.sqlite import SqliteSaver
+    #
+    # return SqliteSaver(connection)
+    #=====================================================
+    def build_agent_checkpointer(exit_stack: contextlib.ExitStack):
+        # 环境变量控制：DEBUG_AGENT_MEMORY=1 本地内存调试
+        if os.getenv("DEBUG_AGENT_MEMORY", "0") == "1":
+            from langgraph.checkpoint.memory import MemorySaver
+            return MemorySaver()
 
-        checkpointer = exit_stack.enter_context(
-            PostgresSaver.from_conn_string(_normalized_database_url())
+        # 下面是你原来完整的Postgres/Sqlite生产逻辑不动
+        backend = get_storage_backend()
+        if backend == STORAGE_BACKEND_POSTGRES:
+            try:
+                from langgraph.checkpoint.postgres import PostgresSaver
+            except ModuleNotFoundError as exc:
+                raise RuntimeError(
+                    "STORAGE_BACKEND=postgresql requires `langgraph-checkpoint-postgres` "
+                    "and `psycopg[binary]` in the runtime environment."
+                ) from exc
+
+            checkpointer = exit_stack.enter_context(
+                PostgresSaver.from_conn_string(_normalized_database_url())
+            )
+            checkpointer.setup()
+            return checkpointer
+
+        sqlite_path = get_sqlite_checkpoint_path()
+        _ensure_parent_dir(sqlite_path)
+        connection = exit_stack.enter_context(
+            contextlib.closing(sqlite3.connect(sqlite_path, check_same_thread=False))
         )
-        checkpointer.setup()
-        return checkpointer
+        from langgraph.checkpoint.sqlite import SqliteSaver
 
-    sqlite_path = get_sqlite_checkpoint_path()
-    _ensure_parent_dir(sqlite_path)
-    connection = exit_stack.enter_context(
-        contextlib.closing(sqlite3.connect(sqlite_path, check_same_thread=False))
-    )
-    from langgraph.checkpoint.sqlite import SqliteSaver
-
-    return SqliteSaver(connection)
+        return SqliteSaver(connection)
+    #======启动之前cmd里设置========
+    #本地调试启动前设置环境变量
+    # set DEBUG_AGENT_MEMORY = 1
+    # python main.py
+    #=============================

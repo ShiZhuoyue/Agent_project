@@ -5,6 +5,7 @@ import os
 import re
 from functools import lru_cache
 from time import perf_counter
+import atexit
 from typing import Any, Iterator, Optional, List
 
 from dotenv import load_dotenv
@@ -29,6 +30,9 @@ from storage import (
     touch_user_session,
     update_chat_thread_activity,
 )
+
+# 原有所有import不动，加下面两行
+from langfuse_config import langfuse_client, langfuse_callback
 
 load_dotenv()
 
@@ -364,11 +368,6 @@ def _base_agent_input(query: str, preflight_latency: float, thread_id: str, user
         "thread_id": thread_id,
         "messages": [HumanMessage(content=query)],
         "metrics": {"00_Harness_Preflight": preflight_latency},
-        # ========== Observer审计纠偏闭环：初始化默认值 ==========
-        "max_replan_times": 3,       # 最大重规划次数，防止死循环
-        "current_replan_round": 0,   # 当前重规划轮次计数器
-        # ========== 三级文献分级精读：初始化默认值 ==========
-        "rated_papers": [],          # Observer打分后的论文列表
     }
 
 
@@ -462,7 +461,16 @@ def _stream_updates(
     metrics: dict[str, Any] = {"00_Harness_Preflight": preflight_latency}
     status = "success"
     final_answer = ""
-    config = {"configurable": {"thread_id": current_thread_id}}
+    config = {
+        "configurable": {"thread_id": current_thread_id},
+        "callbacks": [langfuse_callback],
+        "metadata": {
+            "langfuse_tags": ["stream-chat"],
+            "langfuse_user_id": current_user_id,
+            "langfuse_session_id": current_thread_id,
+            "thread_id": current_thread_id,
+        },
+    }
     stream_started = False
 
     yield _sse_event(
@@ -558,7 +566,6 @@ def _stream_updates(
                     )
                 elif node_name == "observer":
                     past_steps = node_payload.get("past_steps", [])
-                    rated_papers = node_payload.get("rated_papers", [])
                     if past_steps:
                         yield _sse_event(
                             "update",
@@ -568,37 +575,6 @@ def _stream_updates(
                                 "detail": _truncate(str(past_steps[-1]), limit=1200),
                             },
                         )
-                    # ========== 三级文献分级精读：SSE推送打分结果 ==========
-                    if rated_papers:
-                        level_counts: dict[str, int] = {"deep": 0, "medium": 0, "coarse": 0}
-                        for rp in rated_papers:
-                            lv = str(rp.get("read_level", "coarse")).lower()
-                            level_counts[lv] = level_counts.get(lv, 0) + 1
-                        yield _sse_event(
-                            "update",
-                            {
-                                "node": "observer",
-                                "label": "Observer 论文分级打分完成",
-                                "detail": (
-                                    f"共 {len(rated_papers)} 篇论文: "
-                                    f"深度精读={level_counts.get('deep', 0)}, "
-                                    f"中度阅读={level_counts.get('medium', 0)}, "
-                                    f"粗读={level_counts.get('coarse', 0)}"
-                                ),
-                            },
-                        )
-                elif node_name == "executor_read":
-                    # ========== 三级文献分级精读：SSE推送精读进度 ==========
-                    past_steps = node_payload.get("past_steps", [])
-                    read_count: int = len(past_steps) if past_steps else 0
-                    yield _sse_event(
-                        "update",
-                        {
-                            "node": "executor_read",
-                            "label": f"分层精读完成 ({read_count} 篇论文)",
-                            "detail": _truncate(str(past_steps[-1]) if past_steps else "", limit=1200),
-                        },
-                    )
                 elif node_name == "synthesizer":
                     messages = node_payload.get("messages", [])
                     final_answer = _extract_final_answer(messages)
@@ -678,7 +654,16 @@ def _invoke_once(req: ResearchRequest, current_user: dict[str, Any]) -> Research
         thread_id=current_thread_id,
     )
     _persist_user_message(current_user["user_id"], current_thread_id, req.query)
-    config = {"configurable": {"thread_id": current_thread_id}}
+    config = {
+        "configurable": {"thread_id": current_thread_id},
+        "callbacks": [langfuse_callback],
+        "metadata": {
+            "langfuse_tags": ["sync-chat"],
+            "langfuse_user_id": current_user["user_id"],
+            "langfuse_session_id": current_thread_id,
+            "thread_id": current_thread_id,
+        },
+    }
 
     if heuristic_request["intent"] == "clarify":
         metrics = {"00_Harness_Preflight": preflight_latency}
@@ -874,104 +859,8 @@ async def chat_with_agent_stream(
     )
 
 
-# ========== Observer审计纠偏闭环：审计日志查询接口 ==========
-# GET /api/audit/logs?thread_id=<thread_id>
-# 根据 thread_id 返回当前会话的全部结构化审计日志，
-# 包含每轮检索关键词、论文列表、缺陷说明、修正关键词、文献溯源信息。
-class AuditLogItem(BaseModel):
-    round_index: int
-    task_type: str
-    original_query: str
-    planner_keywords: List[str]
-    retrieved_papers: List[dict]
-    paper_summary_results: List[dict]
-    defect_type: Optional[str]
-    defect_desc: Optional[str]
-    need_replan: bool
-    suggest_new_keywords: List[str]
-    # ========== 三级文献分级精读：新增字段 ==========
-    rated_papers: List[dict] = []  # Observer对每篇论文的相关度打分与阅读等级
-
-
-class AuditLogsResponse(BaseModel):
-    thread_id: str
-    total_rounds: int
-    current_defect: Optional[str]
-    current_replan_round: int
-    max_replan_times: int
-    logs: List[AuditLogItem]
-
-
-@app.get("/api/audit/logs", response_model=AuditLogsResponse)
-def get_audit_logs(
-    thread_id: str,
-    current_user: dict[str, Any] = Depends(get_current_user),
-) -> AuditLogsResponse:
-    """返回指定 thread_id 的 Observer 审计纠偏闭环全部结构化日志。
-
-    每轮日志包含：
-    - 检索关键词（planner_keywords）
-    - 检索到的论文列表（retrieved_papers）
-    - 缺陷类型与说明（defect_type / defect_desc）
-    - 建议修正关键词（suggest_new_keywords）
-    - 文献溯源信息（paper_summary_results）
-    """
-    try:
-        agent = get_agent_executor()
-        config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
-        state_snapshot = agent.get_state(config)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Failed to retrieve agent state: {exc}",
-        ) from exc
-
-    if state_snapshot is None or state_snapshot.values is None:
-        return AuditLogsResponse(
-            thread_id=thread_id,
-            total_rounds=0,
-            current_defect=None,
-            current_replan_round=0,
-            max_replan_times=3,
-            logs=[],
-        )
-
-    state_values: dict[str, Any] = dict(state_snapshot.values)
-    raw_logs: list[dict[str, Any]] = state_values.get("audit_logs", []) or []
-    current_defect: Optional[str] = state_values.get("current_defect")
-    current_replan_round: int = state_values.get("current_replan_round", 0)
-    max_replan_times: int = state_values.get("max_replan_times", 3)
-
-    structured_logs: List[AuditLogItem] = []
-    for idx, log_entry in enumerate(raw_logs):
-        structured_logs.append(
-            AuditLogItem(
-                round_index=idx,
-                task_type=str(log_entry.get("task_type", "")),
-                original_query=str(log_entry.get("original_query", "")),
-                planner_keywords=list(log_entry.get("planner_keywords", [])),
-                retrieved_papers=list(log_entry.get("retrieved_papers", [])),
-                paper_summary_results=list(log_entry.get("paper_summary_results", [])),
-                defect_type=log_entry.get("defect_type"),
-                defect_desc=log_entry.get("defect_desc"),
-                need_replan=bool(log_entry.get("need_replan", False)),
-                suggest_new_keywords=list(log_entry.get("suggest_new_keywords", [])),
-                # ========== 三级文献分级精读：传递打分结果 ==========
-                rated_papers=list(log_entry.get("rated_papers", [])),
-            )
-        )
-
-    return AuditLogsResponse(
-        thread_id=thread_id,
-        total_rounds=len(structured_logs),
-        current_defect=current_defect,
-        current_replan_round=current_replan_round,
-        max_replan_times=max_replan_times,
-        logs=structured_logs,
-    )
-
-
 if __name__ == "__main__":
     import uvicorn
 
+    atexit.register(langfuse_client.flush)
     uvicorn.run(app, host="0.0.0.0", port=8000)

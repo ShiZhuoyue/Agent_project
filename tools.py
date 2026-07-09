@@ -5,6 +5,7 @@ import math
 import os
 import re
 from copy import deepcopy
+from functools import lru_cache
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -335,12 +336,21 @@ def _build_compact_query(value: str | None, max_terms: int = 10) -> str:
     return " ".join(terms) if terms else translated
 
 
+# ★ 翻译缓存：避免同一检索请求中多个 query builder 对相同字段重复调用 LLM 翻译
+_translation_cache: dict[str, str] = {}
+
+
 def _translate_search_term(value: str | None) -> str:
     cleaned = _sanitize_query_term(value or "")
     if not cleaned:
         return ""
     if not _contains_non_ascii(cleaned) and not _should_compact_search_term(cleaned):
         return cleaned
+
+    # ★ 缓存命中：直接返回，跳过 LLM 调用
+    cache_key = cleaned.lower()
+    if cache_key in _translation_cache:
+        return _translation_cache[cache_key]
 
     rewriter = _make_rewriter()
     if rewriter is None:
@@ -362,8 +372,74 @@ def _translate_search_term(value: str | None) -> str:
 
     translated = _sanitize_query_term(payload.get("query") or "")
     if translated and not _contains_non_ascii(translated) and not _looks_like_broken_placeholder(translated):
+        _translation_cache[cache_key] = translated
         return translated
+    # ★ 翻译失败日志，方便排查
+    print(f"[WARN] _translate_search_term 翻译失败，原始输入: {cleaned[:80]}")
+    _translation_cache[cache_key] = ""  # 缓存空结果，避免重复失败调用
     return ""
+
+
+def _batch_translate_search_terms(*values: str | None) -> list[str]:
+    """批量翻译多个检索词：一次 LLM 调用完成所有中→英翻译，消除串行阻塞。
+
+    返回与输入一一对应的翻译结果列表；已是英文的字段原样返回，翻译失败的返回空字符串。
+    """
+    sanitized = [_sanitize_query_term(v or "") for v in values]
+    # 标出哪些字段需要翻译
+    needs_translation: list[tuple[int, str]] = []
+    for idx, text in enumerate(sanitized):
+        if text and (_contains_non_ascii(text) or _should_compact_search_term(text)):
+            cache_key = text.lower()
+            if cache_key in _translation_cache:
+                sanitized[idx] = _translation_cache[cache_key]
+            else:
+                needs_translation.append((idx, text))
+
+    if not needs_translation:
+        return sanitized
+
+    rewriter = _make_rewriter()
+    if rewriter is None:
+        for idx, text in needs_translation:
+            sanitized[idx] = text if not _contains_non_ascii(text) else ""
+        return sanitized
+
+    # 构建批量翻译 prompt：一次 LLM 调用翻译所有字段
+    phrases_block = "\n".join(f"{i + 1}. {text}" for i, (_, text) in enumerate(needs_translation))
+    prompt = (
+        "Rewrite each of the following research search phrases into concise English keywords.\n"
+        "Return JSON only with key: translations, which is an array of translated strings in the SAME order.\n"
+        "Each translation must be short, factual, and searchable on arXiv.\n"
+        "Preserve rare technical terms, acronyms, and benchmark names.\n"
+        "If a phrase cannot be translated meaningfully, return an empty string for that position.\n"
+        "Do not explain.\n\n"
+        f"{phrases_block}\n"
+    )
+    try:
+        response = rewriter.invoke(prompt)
+        payload = _parse_json_object(getattr(response, "content", response))
+    except Exception:
+        payload = {}
+
+    translations = payload.get("translations", [])
+    if isinstance(translations, list) and len(translations) == len(needs_translation):
+        for (idx, original_text), trans in zip(needs_translation, translations):
+            t = _sanitize_query_term(str(trans or ""))
+            if t and not _contains_non_ascii(t) and not _looks_like_broken_placeholder(t):
+                sanitized[idx] = t
+                _translation_cache[original_text.lower()] = t
+            else:
+                sanitized[idx] = ""
+                _translation_cache[original_text.lower()] = ""
+                print(f"[WARN] _batch_translate_search_terms 翻译失败，原始输入: {original_text[:80]}")
+    else:
+        for idx, original_text in needs_translation:
+            sanitized[idx] = ""
+            _translation_cache[original_text.lower()] = ""
+            print(f"[WARN] _batch_translate_search_terms 批量翻译解析失败，原始输入: {original_text[:80]}")
+
+    return sanitized
 
 
 def _extract_search_terms(value: str | None, max_terms: int = 6) -> list[str]:
@@ -446,9 +522,15 @@ def _build_anchor_term_queries(filters: dict[str, Any]) -> list[str]:
 def _build_arxiv_queries(filters: dict[str, Any]) -> list[str]:
     category_clause = _category_query_clause(filters)
     queries: list[str] = []
-    translated_author = _translate_search_term(filters.get("author"))
-    translated_title = _translate_search_term(filters.get("paper_title"))
-    translated_topic = _translate_search_term(filters.get("topic"))
+    # ★ 批量翻译：一次 LLM 调用完成 author / paper_title / topic 三个字段的中→英翻译
+    batch_translated = _batch_translate_search_terms(
+        filters.get("author"),
+        filters.get("paper_title"),
+        filters.get("topic"),
+    )
+    translated_author = batch_translated[0]
+    translated_title = batch_translated[1]
+    translated_topic = batch_translated[2]
     compact_topic = _build_compact_query(filters.get("topic"), max_terms=12)
     compact_question = _build_compact_query(filters.get("question"), max_terms=12)
 
@@ -493,10 +575,17 @@ def _build_arxiv_query(filters: dict[str, Any]) -> str:
 
 
 def _build_openalex_query(filters: dict[str, Any]) -> str:
-    translated_topic = _translate_search_term(filters.get("topic"))
-    translated_title = _translate_search_term(filters.get("paper_title"))
-    translated_author = _translate_search_term(filters.get("author"))
-    translated_fallback = _translate_search_term(filters.get("question"))
+    # ★ 批量翻译：一次 LLM 调用完成 topic / paper_title / author / question 四个字段的中→英翻译
+    batch_translated = _batch_translate_search_terms(
+        filters.get("topic"),
+        filters.get("paper_title"),
+        filters.get("author"),
+        filters.get("question"),
+    )
+    translated_topic = batch_translated[0]
+    translated_title = batch_translated[1]
+    translated_author = batch_translated[2]
+    translated_fallback = batch_translated[3]
 
     terms: list[str] = []
     for value in (translated_title, translated_topic, translated_author, translated_fallback):
@@ -1451,8 +1540,9 @@ def _make_rewriter() -> ChatOpenAI | None:
     base_url = os.getenv("OPENAI_API_BASE")
     if not api_key or not base_url:
         return None
-    model = os.getenv("OPENAI_REWRITE_MODEL") or os.getenv("OPENAI_MODEL") or "Qwen/Qwen2.5-7B-Instruct"
-    return ChatOpenAI(model=model, temperature=0, openai_api_key=api_key, base_url=base_url, request_timeout=45)
+    # model = os.getenv("OPENAI_REWRITE_MODEL") or os.getenv("OPENAI_MODEL") or "Qwen/Qwen2.5-7B-Instruct"
+    model = "qwen-turbo"
+    return ChatOpenAI(model=model, temperature=0, openai_api_key=api_key, base_url=base_url, request_timeout=10)
 
 
 def _make_retrieval_reasoner() -> ChatOpenAI | None:
@@ -1460,7 +1550,8 @@ def _make_retrieval_reasoner() -> ChatOpenAI | None:
     base_url = os.getenv("OPENAI_API_BASE")
     if not api_key or not base_url:
         return None
-    model = os.getenv("OPENAI_RETRIEVAL_MODEL") or "Qwen/Qwen2.5-72B-Instruct"
+    # model = os.getenv("OPENAI_RETRIEVAL_MODEL") or "Qwen/Qwen2.5-72B-Instruct"
+    model = "qwen-turbo"
     return ChatOpenAI(model=model, temperature=0, openai_api_key=api_key, base_url=base_url, request_timeout=45)
 
 
@@ -2038,17 +2129,10 @@ arxiv_research_tool = StructuredTool.from_function(
 )
 
 
-@tool
-def citation_stat_tool(search_results: str, operation: str = "average") -> str:
-    """Compute citation statistics (average, sum, sort_by_citations) from arxiv_research_tool results.
-
-    IMPORTANT: This tool MUST be called AFTER arxiv_research_tool has returned its ranked paper results.
-    Do NOT call this tool without first calling arxiv_research_tool.
-
-    Args:
-        search_results: The full output string from arxiv_research_tool containing ranked paper results.
-        operation: One of "average", "sum", "sort_by_citations". Defaults to "average".
-    """
+# ★ 新增：引用统计核心计算函数，lru_cache 缓存重复请求结果，压缩耗时 ★
+@lru_cache(maxsize=1)
+def _compute_citation_stats(search_results: str, operation: str = "average") -> str:
+    """缓存引用统计计算：相同 search_results+operation 直接复用缓存，避免重复解析。"""
     papers = _parse_citation_data(search_results)
     if not papers:
         return (
@@ -2086,6 +2170,20 @@ def citation_stat_tool(search_results: str, operation: str = "average") -> str:
     for paper in papers:
         lines.append(f"  {paper['title']} — citations={paper['citations']}")
     return "\n".join(lines)
+
+
+@tool
+def citation_stat_tool(search_results: str, operation: str = "average") -> str:
+    """Compute citation statistics (average, sum, sort_by_citations) from arxiv_research_tool results.
+
+    IMPORTANT: This tool MUST be called AFTER arxiv_research_tool has returned its ranked paper results.
+    Do NOT call this tool without first calling arxiv_research_tool.
+
+    Args:
+        search_results: The full output string from arxiv_research_tool containing ranked paper results.
+        operation: One of "average", "sum", "sort_by_citations". Defaults to "average".
+    """
+    return _compute_citation_stats(search_results, operation)
 
 
 @tool

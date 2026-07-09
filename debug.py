@@ -5,7 +5,7 @@ from openai import OpenAI
 
 load_dotenv()
 
-DEFAULT_MODEL = os.getenv("DEBUG_MODEL") or os.getenv("OPENAI_MODEL") or "qwen-plus"
+DEFAULT_MODEL = os.getenv("DEBUG_MODEL") or os.getenv("OPENAI_MODEL") or "qwen-turbo"
 
 
 def _require_env(name: str) -> str:
